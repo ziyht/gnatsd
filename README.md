@@ -1,4 +1,4 @@
-##<img src="logos/nats-server.png" width="300">
+## <img src="logos/nats-server.png" width="300">
 [![License][License-Image]][License-Url] [![ReportCard][ReportCard-Image]][ReportCard-Url] [![Build][Build-Status-Image]][Build-Status-Url] [![Release][Release-Image]][Release-Url] [![Coverage][Coverage-Image]][Coverage-Url]
 
 A High Performance [NATS](https://nats.io) Server written in [Go.](http://golang.org)
@@ -11,7 +11,7 @@ Install and run the NATS server:
 
 ```
 go get github.com/nats-io/gnatsd
-gnatsd -D -V
+gnatsd
 ```
 
 Install the [Go NATS client](https://github.com/nats-io/go-nats/blob/master/README.md):
@@ -49,9 +49,9 @@ To start the NATS server with default settings (and no authentication or cluster
 
 ```sh
 > ./gnatsd
-[37274] 2016/12/15 18:33:12.119961 [INF] Starting nats-server version 0.9.6
-[37274] 2016/12/15 18:33:12.120060 [INF] Listening for client connections on 0.0.0.0:4222
-[37274] 2016/12/15 18:33:12.120154 [INF] Server is ready
+[71829] 2017/09/22 14:57:27.740599 [INF] Starting nats-server version 1.0.4
+[71829] 2017/09/22 14:57:27.740735 [INF] Listening for client connections on 0.0.0.0:4222
+[71829] 2017/09/22 14:57:27.740739 [INF] Server is ready
 ```
 
 The server is started and listening for client connections on port 4222 (the default) from all available interfaces. The logs are displayed to stdout as shown above in the server output.
@@ -69,7 +69,7 @@ The NATS server uses a [text based protocol](http://nats.io/documentation/intern
 Trying 107.170.221.32...
 Connected to demo.nats.io.
 Escape character is '^]'.
-INFO {"server_id":"kG19DsXX1UVeSyEjhl3RFw","version":"0.9.6","go":"go1.7.4","host":"0.0.0.0","port":4222, ...}
+INFO {"server_id":"kG19DsXX1UVeSyEjhl3RFw","version":"1.0.4","go":"go1.8.3","host":"0.0.0.0","port":4222, ...}
 SUB foo 1
 +OK
 PUB foo 11
@@ -77,6 +77,66 @@ Hello World
 +OK
 MSG foo 1 11
 Hello World
+```
+
+### Process Signaling
+
+On Unix systems, the NATS server responds to the following signals:
+
+| Signal  | Result                                |
+| ------- | ------------------------------------- |
+| SIGKILL | Kills the process immediately         |
+| SIGINT  | Stops the server gracefully           |
+| SIGUSR1 | Reopens the log file for log rotation |
+| SIGHUP  | Reloads server configuration file     |
+
+The `gnatsd` binary can be used to send these signals to running NATS servers using the `-sl` flag:
+
+```sh
+# Reload server configuration
+gnatsd -sl reload
+
+# Reopen log file for log rotation
+gnatsd -sl reopen
+
+# Stop the server
+gnatsd -sl stop
+```
+
+If there are multiple `gnatsd` processes running, specify a PID:
+
+```sh
+gnatsd -sl stop=<pid>
+```
+
+See the [Windows Service](#windows-service) section for information on signaling the NATS server on Windows.
+
+### Windows Service
+
+The NATS server supports running as a Windows service. In fact, this is the recommended way of running NATS on Windows. There is currently no installer and instead users should use `sc.exe` to install the service:
+
+```batch
+sc.exe create gnatsd binPath= "%NATS_PATH%\gnatsd.exe [gnatsd flags]"
+sc.exe start gnatsd
+```
+
+The above will create and start a `gnatsd` service. Note that the gnatsd flags should be passed in when creating the service. This allows for running multiple NATS server configurations on a single Windows server by using a 1:1 service instance per installed NATS server service. Once the service is running, it can be controlled using `sc.exe` or `gnatsd.exe -sl`:
+
+```batch
+REM Reload server configuration
+gnatsd.exe -sl reload
+
+REM Reopen log file for log rotation
+gnatsd.exe -sl reopen
+
+REM Stop the server
+gnatsd.exe -sl stop
+```
+
+The above commands will default to controlling the `gnatsd` service. If the service is another name, it can be specified:
+
+```batch
+gnatsd.exe -sl stop=<service name>
 ```
 
 ## Command line arguments
@@ -91,11 +151,12 @@ Server Options:
     -m, --http_port <port>           Use port for http monitoring
     -ms,--https_port <port>          Use port for https monitoring
     -c, --config <file>              Configuration file
+    -sl,--signal <signal>[=<pid>]    Send signal to gnatsd process (stop, quit, reopen, reload)
 
 Logging Options:
     -l, --log <file>                 File to redirect log output
     -T, --logtime                    Timestamp log entries (default: true)
-    -s, --syslog                     Enable syslog as log method
+    -s, --syslog                     Log to syslog or windows event log
     -r, --remote_syslog <addr>       Syslog server addr (udp://localhost:514)
     -D, --debug                      Enable debugging output
     -V, --trace                      Trace the raw protocol
@@ -117,6 +178,7 @@ Cluster Options:
         --routes <rurl-1, rurl-2>    Routes to solicit and connect
         --cluster <cluster-url>      Cluster URL for solicited routes
         --no_advertise <bool>        Advertise known cluster IPs to clients
+        --connect_retries <number>   For implicit routes, number of connect retries
 
 
 Common Options:
@@ -137,7 +199,7 @@ http: localhost:8222 # HTTP monitoring port
 # Authorization for client connections
 authorization {
   user:     derek
-  # ./util/mkpassword -p T0pS3cr3t
+  # ./util/mkpasswd -p T0pS3cr3t
   password: $2a$11$W2zko751KUvVy59mUTWmpOdWjpEm5qhcCZRd05GjI/sSOT.xtiHyG
   timeout:  1
 }
@@ -151,7 +213,7 @@ cluster {
   # Authorization for route connections
   authorization {
     user: route_user
-    # ./util/mkpassword -p T0pS3cr3tT00!
+    # ./util/mkpasswd -p T0pS3cr3tT00!
     password: $2a$11$xH8dkGrty1cBNtZjhPeWJewu/YPbSU.rXJWmS6SFilOBXzmZoMk9m
     timeout: 0.5
   }
@@ -185,7 +247,13 @@ max_control_line: 512
 
 # maximum payload
 max_payload: 65536
+
+# Duration the server can block on a socket write to a client.  Exceeding the 
+# deadline will designate a client as a slow consumer.
+write_deadline: "2s"
 ```
+
+Inside configuration files, string values support the following escape characters: `\xXX, \t, \n, \r, \", \\`.  Take note that when specifying directory paths in options such as `pid_file` and `log_file` on Windows, you'll need to escape backslashes, e.g. `log_file:  "c:\\logging\\log.txt"`, or use unix style (`/`) path separators.
 
 ## Variables
 
@@ -239,7 +307,7 @@ The following example demonstrates how to run a cluster of 3 servers on the same
 See also [clustered NATS](http://nats.io/documentation/server/gnatsd-cluster/) for clustered NATS examples using Docker.
 
 ```
-gnatsd -p 4222 -cluster nats://localhost:4248 -D
+gnatsd -p 4222 -cluster nats://localhost:4248
 ```
 
 Alternatively, you could use a configuration file, let's call it `seed.conf`, with a content similar to this:
@@ -367,11 +435,11 @@ The NATS server supports single and multi-user/client authentication. See also t
 For single-user authentication, you can start the NATS server with authentication enabled by passing in the required credentials on the command line, or by passing in a token.
 
 ```
-gnatsd -DV --user foo --pass bar
+gnatsd --user foo --pass bar
 ```
 
 ```
-gnatsd -DV -auth 'S3Cr3T0k3n!'
+gnatsd -auth 'S3Cr3T0k3n!'
 ```
 
 Clients can connect using:
@@ -392,6 +460,24 @@ authorization {
   password: T0pS3cr3t
   timeout:  1
 }
+```
+
+Or, if you chose to use a token:
+
+```
+authorization {
+  # You can generate the token using /util/mkpasswd.go
+  token:   $2a$11$pBwUBpza8vdJ7tWZcP5GRO13qRgh4dwNn8g67k5i/41yIKBp.sHke
+  timeout: 1
+}
+```
+
+>If you chose to use a token for client's authentication and generate the token by `/util/mkpasswd.go` then you must use the generated bcrypt hash as the token in server config, as written above, and the generated pass as the token in client configurations.
+
+```
+$ go run util/mkpasswd.go 
+pass: D#6)e0ht^@61kU5!^!owrX // NATS client token
+bcrypt hash: $2a$11$bXz1Mi5xM.rRUnYRT0Vb2el6sSzVrqA0DJKdt.5Itj1C1K4HT9FDG // server authorization token
 ```
 
 **Multi-user authentication**
@@ -572,18 +658,18 @@ Examples using the test certificates which are self signed for localhost and 127
 ```bash
 > ./gnatsd --tls --tlscert=./test/configs/certs/server-cert.pem --tlskey=./test/configs/certs/server-key.pem
 
-[2935] 2016/04/26 13:34:30.685413 [INF] Starting nats-server version 0.8.0.beta
-[2935] 2016/04/26 13:34:30.685509 [INF] Listening for client connections on 0.0.0.0:4222
-[2935] 2016/04/26 13:34:30.685656 [INF] TLS required for client connections
-[2935] 2016/04/26 13:34:30.685660 [INF] Server is ready
+[71505] 2017/09/22 14:53:19.769151 [INF] Starting nats-server version 1.0.4
+[71505] 2017/09/22 14:53:19.769315 [INF] Listening for client connections on 0.0.0.0:4222
+[71505] 2017/09/22 14:53:19.769319 [INF] TLS required for client connections
+[71505] 2017/09/22 14:53:19.769321 [INF] Server is ready
 ```
 
-Notice that the log  indicates that the client connections will be required to use TLS. If you run the server in Debug mode with -D or -DV, the logs will show the cipher suite selection for each connected client.
+Notice that the log  indicates that the client connections will be required to use TLS.  If you run the server in Debug mode with `-D` or `-DV`, the logs will show the cipher suite selection for each connected client.
 
 ```
-[15146] 2015/12/03 12:38:37.733139 [DBG] ::1:63330 - cid:1 - Starting TLS client connection handshake
-[15146] 2015/12/03 12:38:37.751948 [DBG] ::1:63330 - cid:1 - TLS handshake complete
-[15146] 2015/12/03 12:38:37.751959 [DBG] ::1:63330 - cid:1 - TLS version 1.2, cipher suite TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+[72167] 2017/06/30 13:08:42.658129 [DBG] ::1:63035 - cid:4 - Starting TLS client connection handshake
+[72167] 2017/06/30 13:08:42.674096 [DBG] ::1:63035 - cid:4 - TLS handshake complete
+[72167] 2017/06/30 13:08:42.674121 [DBG] ::1:63035 - cid:4 - TLS version 1.2, cipher suite TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 ```
 
 If you want the server to enforce and require client certificates as well via the command line, utilize this example.
@@ -634,17 +720,53 @@ To enable monitoring via the configuration file, use `host:port` (there is no ex
 For example, running the `gnatsd -m 8222` command, you should see that the NATS server starts with the HTTP monitoring port enabled. To view the monitoring home page, go to <a href="http://localhost:8222/" target="_blank">http://localhost:8222/</a>.
 
 ```
-[83249] 2016/06/23 19:39:35.173557 [INF] Starting nats-server version 0.8.0
-[83249] 2016/06/23 19:39:35.173835 [INF] Starting http monitor on 0.0.0.0:8222
-[83249] 2016/06/23 19:39:35.175193 [INF] Listening for client connections on 0.0.0.0:4222
-[83249] 2016/06/23 19:39:35.175226 [INF] Server is ready
+[71859] 2017/09/22 14:57:45.206152 [INF] Starting nats-server version 1.0.4
+[71859] 2017/09/22 14:57:45.206292 [INF] Starting http monitor on 0.0.0.0:8222
+[71859] 2017/09/22 14:57:45.206328 [INF] Listening for client connections on 0.0.0.0:4222
+[71859] 2017/09/22 14:57:45.206330 [INF] Server is ready
 ```
+
+## Development
+
+This section contains notes for those looking to do development on gnatsd.
+
+### Windows
+
+Some unit tests make use of temporary symlinks for testing purposes. On Windows, this can fail due to insufficient privileges:
+
+```
+--- FAIL: TestConfigReload (0.00s)
+        reload_test.go:175: Error creating symlink: symlink .\configs\reload\test.conf g:\src\github.com\nats-io\gnatsd\server\tmp.conf: A required privilege is not held by the client.
+FAIL
+```
+
+Similarly, this can fail when creating a symlink on a network drive, which is typically not allowed by default:
+
+```
+--- FAIL: TestConfigReload (0.00s)
+        reload_test.go:175: Error creating symlink: symlink .\configs\reload\test.conf g:\src\github.com\nats-io\gnatsd\server\tmp.conf: Incorrect function.
+FAIL
+```
+
+If this is the case, ensure that the tests are run with privileges on a local drive (e.g. running on `C:` as admin).
+
+## Community and Contributing
+
+NATS has a vibrant and friendly community.  If you are interested in connecting with other NATS users or contributing, read about our [community](http://nats.io/community/) on [NATS.io](http://nats.io/).
+
+### NATS Office Hours
+
+The NATS maintainers hold online open office hours on the __2nd Monday of every month at 1PM Eastern US / 10AM Pacific US__ where we discuss the future of NATS, issues, PRs, answer questions, and sorts of other good stuff.  Anyone is welcome to participate or listen in, whether you are using NATS or just interested in learning more.
+
+The office hours agenda and zoom link can be found [here](https://docs.google.com/a/apcera.com/document/d/1vrkEXW9CN0_MX_AkerHnYrgduiUAng5EVfafCbXiYc4/edit?usp=sharing), where we hope you'll comment about what you would like to discuss!
+
+
 
 ## License
 
 (The MIT License)
 
-Copyright (c) 2012-2016 Apcera Inc.
+Copyright (c) 2012-2017 Apcera Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to
@@ -668,8 +790,8 @@ IN THE SOFTWARE.
 [License-Image]: https://img.shields.io/badge/License-MIT-blue.svg
 [Build-Status-Url]: http://travis-ci.org/nats-io/gnatsd
 [Build-Status-Image]: https://travis-ci.org/nats-io/gnatsd.svg?branch=master
-[Release-Url]: https://github.com/nats-io/gnatsd/releases/tag/v0.9.6
-[Release-image]: http://img.shields.io/badge/release-v0.9.6-1eb0fc.svg
+[Release-Url]: https://github.com/nats-io/gnatsd/releases/tag/v1.0.4
+[Release-image]: http://img.shields.io/badge/release-v1.0.4-1eb0fc.svg
 [Coverage-Url]: https://coveralls.io/r/nats-io/gnatsd?branch=master
 [Coverage-image]: https://coveralls.io/repos/github/nats-io/gnatsd/badge.svg?branch=master
 [ReportCard-Url]: http://goreportcard.com/report/nats-io/gnatsd

@@ -30,12 +30,6 @@ type serverInfo struct {
 	MaxPayload   int64  `json:"max_payload"`
 }
 
-type mockAuth struct{}
-
-func (m *mockAuth) Check(c ClientAuth) bool {
-	return true
-}
-
 func createClientAsync(ch chan *client, s *Server, cli net.Conn) {
 	go func() {
 		c := s.createClient(cli)
@@ -56,9 +50,6 @@ func rawSetup(serverOptions Options) (*Server, *client, *bufio.Reader, string) {
 	cli, srv := net.Pipe()
 	cr := bufio.NewReaderSize(cli, maxBufSize)
 	s := New(&serverOptions)
-	if serverOptions.Authorization != "" {
-		s.SetClientAuthMethod(&mockAuth{})
-	}
 
 	ch := make(chan *client)
 	createClientAsync(ch, s, srv)
@@ -598,14 +589,23 @@ func TestClientMapRemoval(t *testing.T) {
 }
 
 func TestAuthorizationTimeout(t *testing.T) {
-	serverOptions := defaultServerOptions
+	serverOptions := DefaultOptions()
 	serverOptions.Authorization = "my_token"
-	serverOptions.AuthTimeout = 1
-	s, _, cr, _ := rawSetup(serverOptions)
-	s.SetClientAuthMethod(&mockAuth{})
+	serverOptions.AuthTimeout = 0.4
+	s := RunServer(serverOptions)
+	defer s.Shutdown()
 
-	time.Sleep(secondsToDuration(serverOptions.AuthTimeout))
-	l, err := cr.ReadString('\n')
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", serverOptions.Host, serverOptions.Port))
+	if err != nil {
+		t.Fatalf("Error dialing server: %v\n", err)
+	}
+	defer conn.Close()
+	client := bufio.NewReaderSize(conn, maxBufSize)
+	if _, err := client.ReadString('\n'); err != nil {
+		t.Fatalf("Error receiving info from server: %v\n", err)
+	}
+	time.Sleep(3 * secondsToDuration(serverOptions.AuthTimeout))
+	l, err := client.ReadString('\n')
 	if err != nil {
 		t.Fatalf("Error receiving info from server: %v\n", err)
 	}
@@ -634,20 +634,23 @@ func TestTwoTokenPubMatchSingleTokenSub(t *testing.T) {
 }
 
 func TestUnsubRace(t *testing.T) {
-	s := RunServer(nil)
+	opts := DefaultOptions()
+	s := RunServer(opts)
 	defer s.Shutdown()
 
-	nc, err := nats.Connect(fmt.Sprintf("nats://%s:%d",
-		DefaultOptions.Host,
-		DefaultOptions.Port))
+	url := fmt.Sprintf("nats://%s:%d",
+		s.getOpts().Host,
+		s.Addr().(*net.TCPAddr).Port,
+	)
+	nc, err := nats.Connect(url)
 	if err != nil {
-		t.Fatalf("Error creating client: %v\n", err)
+		t.Fatalf("Error creating client to %s: %v\n", url, err)
 	}
 	defer nc.Close()
 
 	ncp, err := nats.Connect(fmt.Sprintf("nats://%s:%d",
-		DefaultOptions.Host,
-		DefaultOptions.Port))
+		s.getOpts().Host,
+		s.Addr().(*net.TCPAddr).Port))
 	if err != nil {
 		t.Fatalf("Error creating client: %v\n", err)
 	}
@@ -682,8 +685,8 @@ func TestTLSCloseClientConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error processing config file: %v", err)
 	}
-	opts.Authorization = ""
 	opts.TLSTimeout = 100
+	opts.NoLog = true
 	s := RunServer(opts)
 	defer s.Shutdown()
 
@@ -704,7 +707,7 @@ func TestTLSCloseClientConnection(t *testing.T) {
 		t.Fatalf("Unexpected error during handshake: %v", err)
 	}
 	br = bufio.NewReaderSize(tlsConn, 100)
-	connectOp := []byte("CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":true}\r\n")
+	connectOp := []byte("CONNECT {\"user\":\"derek\",\"pass\":\"foo\",\"verbose\":false,\"pedantic\":false,\"tls_required\":true}\r\n")
 	if _, err := tlsConn.Write(connectOp); err != nil {
 		t.Fatalf("Unexpected error writing CONNECT: %v", err)
 	}
@@ -763,4 +766,48 @@ func TestTLSCloseClientConnection(t *testing.T) {
 	// Close the client
 	cli.closeConnection()
 	ch <- true
+}
+
+// This tests issue #558
+func TestWildcardCharsInLiteralSubjectWorks(t *testing.T) {
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	ch := make(chan bool, 1)
+	// This subject is a literal even though it contains `*` and `>`,
+	// they are not treated as wildcards.
+	subj := "foo.bar,*,>,baz"
+	cb := func(_ *nats.Msg) {
+		ch <- true
+	}
+	for i := 0; i < 2; i++ {
+		sub, err := nc.Subscribe(subj, cb)
+		if err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+		if err := nc.Flush(); err != nil {
+			t.Fatalf("Error on flush: %v", err)
+		}
+		if err := nc.LastError(); err != nil {
+			t.Fatalf("Server reported error: %v", err)
+		}
+		if err := nc.Publish(subj, []byte("msg")); err != nil {
+			t.Fatalf("Error on publish: %v", err)
+		}
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("Should have received the message")
+		}
+		if err := sub.Unsubscribe(); err != nil {
+			t.Fatalf("Error on unsubscribe: %v", err)
+		}
+	}
 }

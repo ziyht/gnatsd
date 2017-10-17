@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	dbg "runtime/debug"
 )
@@ -208,7 +207,7 @@ func TestSublistRemoveCleanupWildcards(t *testing.T) {
 func TestSublistInvalidSubjectsInsert(t *testing.T) {
 	s := NewSublist()
 
-	// Insert, or subscribtions, can have wildcards, but not empty tokens,
+	// Insert, or subscriptions, can have wildcards, but not empty tokens,
 	// and can not have a FWC that is not the terminal token.
 
 	// beginning empty token
@@ -371,6 +370,49 @@ func TestSublistValidLiteralSubjects(t *testing.T) {
 	checkBool(IsValidLiteralSubject("foo.bar.>"), false, t)
 	checkBool(IsValidLiteralSubject("*"), false, t)
 	checkBool(IsValidLiteralSubject(">"), false, t)
+	// The followings have widlcards characters but are not
+	// considered as such because they are not individual tokens.
+	checkBool(IsValidLiteralSubject("foo*"), true, t)
+	checkBool(IsValidLiteralSubject("foo**"), true, t)
+	checkBool(IsValidLiteralSubject("foo.**"), true, t)
+	checkBool(IsValidLiteralSubject("foo*bar"), true, t)
+	checkBool(IsValidLiteralSubject("foo.*bar"), true, t)
+	checkBool(IsValidLiteralSubject("foo*.bar"), true, t)
+	checkBool(IsValidLiteralSubject("*bar"), true, t)
+	checkBool(IsValidLiteralSubject("foo>"), true, t)
+	checkBool(IsValidLiteralSubject("foo>>"), true, t)
+	checkBool(IsValidLiteralSubject("foo.>>"), true, t)
+	checkBool(IsValidLiteralSubject("foo>bar"), true, t)
+	checkBool(IsValidLiteralSubject("foo.>bar"), true, t)
+	checkBool(IsValidLiteralSubject("foo>.bar"), true, t)
+	checkBool(IsValidLiteralSubject(">bar"), true, t)
+}
+
+func TestSublistValidlSubjects(t *testing.T) {
+	checkBool(IsValidSubject("."), false, t)
+	checkBool(IsValidSubject(".foo"), false, t)
+	checkBool(IsValidSubject("foo."), false, t)
+	checkBool(IsValidSubject("foo..bar"), false, t)
+	checkBool(IsValidSubject(">.bar"), false, t)
+	checkBool(IsValidSubject("foo.>.bar"), false, t)
+	checkBool(IsValidSubject("foo"), true, t)
+	checkBool(IsValidSubject("foo.bar.*"), true, t)
+	checkBool(IsValidSubject("foo.bar.>"), true, t)
+	checkBool(IsValidSubject("*"), true, t)
+	checkBool(IsValidSubject(">"), true, t)
+	checkBool(IsValidSubject("foo*"), true, t)
+	checkBool(IsValidSubject("foo**"), true, t)
+	checkBool(IsValidSubject("foo.**"), true, t)
+	checkBool(IsValidSubject("foo*bar"), true, t)
+	checkBool(IsValidSubject("foo.*bar"), true, t)
+	checkBool(IsValidSubject("foo*.bar"), true, t)
+	checkBool(IsValidSubject("*bar"), true, t)
+	checkBool(IsValidSubject("foo>"), true, t)
+	checkBool(IsValidSubject("foo.>>"), true, t)
+	checkBool(IsValidSubject("foo>bar"), true, t)
+	checkBool(IsValidSubject("foo.>bar"), true, t)
+	checkBool(IsValidSubject("foo>.bar"), true, t)
+	checkBool(IsValidSubject(">bar"), true, t)
 }
 
 func TestSublistMatchLiterals(t *testing.T) {
@@ -386,6 +428,20 @@ func TestSublistMatchLiterals(t *testing.T) {
 	checkBool(matchLiteral("foo.bar", "foo"), false, t)
 	checkBool(matchLiteral("stats.test.foos", "stats.test.foos"), true, t)
 	checkBool(matchLiteral("stats.test.foos", "stats.test.foo"), false, t)
+	checkBool(matchLiteral("stats.test", "stats.test.*"), false, t)
+	checkBool(matchLiteral("stats.test.foos", "stats.*"), false, t)
+	checkBool(matchLiteral("stats.test.foos", "stats.*.*.foos"), false, t)
+
+	// These are cases where wildcards characters should not be considered
+	// wildcards since they do not follow the rules of wildcards.
+	checkBool(matchLiteral("*bar", "*bar"), true, t)
+	checkBool(matchLiteral("foo*", "foo*"), true, t)
+	checkBool(matchLiteral("foo*bar", "foo*bar"), true, t)
+	checkBool(matchLiteral("foo.***.bar", "foo.***.bar"), true, t)
+	checkBool(matchLiteral(">bar", ">bar"), true, t)
+	checkBool(matchLiteral("foo>", "foo>"), true, t)
+	checkBool(matchLiteral("foo>bar", "foo>bar"), true, t)
+	checkBool(matchLiteral("foo.>>>.bar", "foo.>>>.bar"), true, t)
 }
 
 func TestSublistBadSubjectOnRemove(t *testing.T) {
@@ -419,12 +475,45 @@ func TestSublistTwoTokenPubMatchSingleTokenSub(t *testing.T) {
 	verifyLen(r.psubs, 0, t)
 }
 
+func TestSublistInsertWithWildcardsAsLiterals(t *testing.T) {
+	s := NewSublist()
+	subjects := []string{"foo.*-", "foo.>-"}
+	for _, subject := range subjects {
+		sub := newSub(subject)
+		s.Insert(sub)
+		// Should find no match
+		r := s.Match("foo.bar")
+		verifyLen(r.psubs, 0, t)
+		// Should find a match
+		r = s.Match(subject)
+		verifyLen(r.psubs, 1, t)
+	}
+}
+
+func TestSublistRemoveWithWildcardsAsLiterals(t *testing.T) {
+	s := NewSublist()
+	subjects := []string{"foo.*-", "foo.>-"}
+	for _, subject := range subjects {
+		sub := newSub(subject)
+		s.Insert(sub)
+		// Should find no match
+		rsub := newSub("foo.bar")
+		s.Remove(rsub)
+		if c := s.Count(); c != 1 {
+			t.Fatalf("Expected sublist to still contain sub, got %v", c)
+		}
+		s.Remove(sub)
+		if c := s.Count(); c != 0 {
+			t.Fatalf("Expected sublist to be empty, got %v", c)
+		}
+	}
+}
+
 // -- Benchmarks Setup --
 
 var subs []*subscription
 var toks = []string{"apcera", "continuum", "component", "router", "api", "imgr", "jmgr", "auth"}
 var sl = NewSublist()
-var results = make([]*subscription, 0, 64)
 
 func init() {
 	subs = make([]*subscription, 0, 256*1024)
@@ -537,12 +626,38 @@ func Benchmark____________Sublist100XMultipleReads(b *testing.B) {
 	multiRead(b, 100)
 }
 
-func _BenchmarkRSS(b *testing.B) {
-	runtime.GC()
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	println("HEAP:", m.HeapObjects)
-	println("ALLOC:", m.Alloc)
-	println("TOTAL ALLOC:", m.TotalAlloc)
-	time.Sleep(30 * 1e9)
+func Benchmark_SublistMatchLiteral(b *testing.B) {
+	b.StopTimer()
+	cachedSubj := "foo.foo.foo.foo.foo.foo.foo.foo.foo.foo"
+	subjects := []string{
+		"foo.foo.foo.foo.foo.foo.foo.foo.foo.foo",
+		"foo.foo.foo.foo.foo.foo.foo.foo.foo.>",
+		"foo.foo.foo.foo.foo.foo.foo.foo.>",
+		"foo.foo.foo.foo.foo.foo.foo.>",
+		"foo.foo.foo.foo.foo.foo.>",
+		"foo.foo.foo.foo.foo.>",
+		"foo.foo.foo.foo.>",
+		"foo.foo.foo.>",
+		"foo.foo.>",
+		"foo.>",
+		">",
+		"foo.foo.foo.foo.foo.foo.foo.foo.foo.*",
+		"foo.foo.foo.foo.foo.foo.foo.foo.*.*",
+		"foo.foo.foo.foo.foo.foo.foo.*.*.*",
+		"foo.foo.foo.foo.foo.foo.*.*.*.*",
+		"foo.foo.foo.foo.foo.*.*.*.*.*",
+		"foo.foo.foo.foo.*.*.*.*.*.*",
+		"foo.foo.foo.*.*.*.*.*.*.*",
+		"foo.foo.*.*.*.*.*.*.*.*",
+		"foo.*.*.*.*.*.*.*.*.*",
+		"*.*.*.*.*.*.*.*.*.*",
+	}
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		for _, subject := range subjects {
+			if !matchLiteral(cachedSubj, subject) {
+				b.Fatalf("Subject %q no match with %q", cachedSubj, subject)
+			}
+		}
+	}
 }

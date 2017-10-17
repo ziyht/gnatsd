@@ -47,26 +47,27 @@ type Info struct {
 // Server is our main struct.
 type Server struct {
 	gcid uint64
-	grid uint64
 	stats
 	mu            sync.Mutex
 	info          Info
 	infoJSON      []byte
 	sl            *Sublist
+	configFile    string
+	optsMu        sync.RWMutex
 	opts          *Options
-	cAuth         Auth
-	rAuth         Auth
-	trace         bool
-	debug         bool
 	running       bool
+	shutdown      bool
 	listener      net.Listener
 	clients       map[uint64]*client
 	routes        map[uint64]*client
 	remotes       map[string]*client
+	users         map[string]*User
 	totalClients  uint64
 	done          chan bool
 	start         time.Time
 	http          net.Listener
+	httpHandler   http.Handler
+	profiler      net.Listener
 	httpReqStats  map[string]uint64
 	routeListener net.Listener
 	routeInfo     Info
@@ -77,6 +78,13 @@ type Server struct {
 	grRunning     bool
 	grWG          sync.WaitGroup // to wait on various go routines
 	cproto        int64          // number of clients supporting async INFO
+	configTime    time.Time      // last time config was loaded
+	logging       struct {
+		sync.RWMutex
+		logger Logger
+		trace  int32
+		debug  int32
+	}
 }
 
 // Make sure all are 64bits for atomic use
@@ -110,14 +118,15 @@ func New(opts *Options) *Server {
 		clientConnectURLs: make(map[string]struct{}),
 	}
 
+	now := time.Now()
 	s := &Server{
-		info:  info,
-		sl:    NewSublist(),
-		opts:  opts,
-		debug: opts.Debug,
-		trace: opts.Trace,
-		done:  make(chan bool, 1),
-		start: time.Now(),
+		configFile: opts.ConfigFile,
+		info:       info,
+		sl:         NewSublist(),
+		opts:       opts,
+		done:       make(chan bool, 1),
+		start:      now,
+		configTime: now,
 	}
 
 	s.mu.Lock()
@@ -137,38 +146,46 @@ func New(opts *Options) *Server {
 	// Used to kick out all of the route
 	// connect Go routines.
 	s.rcQuit = make(chan bool)
+
+	// Used to setup Authorization.
+	s.configureAuthorization()
+
 	s.generateServerInfoJSON()
 	s.handleSignals()
 
 	return s
 }
 
-// SetClientAuthMethod sets the authentication method for clients.
-func (s *Server) SetClientAuthMethod(authMethod Auth) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.info.AuthRequired = true
-	s.cAuth = authMethod
-
-	s.generateServerInfoJSON()
+func (s *Server) getOpts() *Options {
+	s.optsMu.RLock()
+	opts := s.opts
+	s.optsMu.RUnlock()
+	return opts
 }
 
-// SetRouteAuthMethod sets the authentication method for routes.
-func (s *Server) SetRouteAuthMethod(authMethod Auth) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rAuth = authMethod
+func (s *Server) setOpts(opts *Options) {
+	s.optsMu.Lock()
+	s.opts = opts
+	s.optsMu.Unlock()
 }
 
 func (s *Server) generateServerInfoJSON() {
 	// Generate the info json
 	b, err := json.Marshal(s.info)
 	if err != nil {
-		Fatalf("Error marshalling INFO JSON: %+v\n", err)
+		s.Fatalf("Error marshaling INFO JSON: %+v\n", err)
 		return
 	}
 	s.infoJSON = []byte(fmt.Sprintf("INFO %s %s", b, CR_LF))
+}
+
+func (s *Server) generateRouteInfoJSON() {
+	b, err := json.Marshal(s.routeInfo)
+	if err != nil {
+		s.Fatalf("Error marshaling route INFO JSON: %+v\n", err)
+		return
+	}
+	s.routeInfoJSON = []byte(fmt.Sprintf(InfoProto, b))
 }
 
 // PrintAndDie is exported for access in other packages.
@@ -195,7 +212,7 @@ func ProcessCommandLineArgs(cmd *flag.FlagSet) (showVersion bool, showHelp bool,
 		case "help":
 			return false, true, nil
 		default:
-			return false, false, fmt.Errorf("Unrecognized command: %q\n", arg)
+			return false, false, fmt.Errorf("unrecognized command: %q", arg)
 		}
 	}
 
@@ -209,19 +226,16 @@ func (s *Server) isRunning() bool {
 	return s.running
 }
 
-func (s *Server) logPid() {
+func (s *Server) logPid() error {
 	pidStr := strconv.Itoa(os.Getpid())
-	err := ioutil.WriteFile(s.opts.PidFile, []byte(pidStr), 0660)
-	if err != nil {
-		PrintAndDie(fmt.Sprintf("Could not write pidfile: %v\n", err))
-	}
+	return ioutil.WriteFile(s.getOpts().PidFile, []byte(pidStr), 0660)
 }
 
 // Start up the server, this will block.
 // Start via a Go routine if needed.
 func (s *Server) Start() {
-	Noticef("Starting nats-server version %s", VERSION)
-	Debugf("Go build version %s", s.info.GoVersion)
+	s.Noticef("Starting nats-server version %s", VERSION)
+	s.Debugf("Go build version %s", s.info.GoVersion)
 
 	// Avoid RACE between Start() and Shutdown()
 	s.mu.Lock()
@@ -232,23 +246,20 @@ func (s *Server) Start() {
 	s.grRunning = true
 	s.grMu.Unlock()
 
+	// Snapshot server options.
+	opts := s.getOpts()
+
 	// Log the pid to a file
-	if s.opts.PidFile != _EMPTY_ {
-		s.logPid()
-	}
-
-	// Start up the http server if needed.
-	if s.opts.HTTPPort != 0 {
-		s.StartHTTPMonitoring()
-	}
-
-	// Start up the https server if needed.
-	if s.opts.HTTPSPort != 0 {
-		if s.opts.TLSConfig == nil {
-			Fatalf("TLS cert and key required for HTTPS")
-			return
+	if opts.PidFile != _EMPTY_ {
+		if err := s.logPid(); err != nil {
+			PrintAndDie(fmt.Sprintf("Could not write pidfile: %v\n", err))
 		}
-		s.StartHTTPSMonitoring()
+	}
+
+	// Start monitoring if needed
+	if err := s.StartMonitoring(); err != nil {
+		s.Fatalf("Can't start monitoring: %v", err)
+		return
 	}
 
 	// The Routing routine needs to wait for the client listen
@@ -256,14 +267,14 @@ func (s *Server) Start() {
 	clientListenReady := make(chan struct{})
 
 	// Start up routing as well if needed.
-	if s.opts.Cluster.Port != 0 {
+	if opts.Cluster.Port != 0 {
 		s.startGoRoutine(func() {
 			s.StartRouting(clientListenReady)
 		})
 	}
 
 	// Pprof http endpoint for the profiler.
-	if s.opts.ProfPort != 0 {
+	if opts.ProfPort != 0 {
 		s.StartProfiler()
 	}
 
@@ -277,11 +288,11 @@ func (s *Server) Shutdown() {
 	s.mu.Lock()
 
 	// Prevent issues with multiple calls.
-	if !s.running {
+	if s.shutdown {
 		s.mu.Unlock()
 		return
 	}
-
+	s.shutdown = true
 	s.running = false
 	s.grMu.Lock()
 	s.grRunning = false
@@ -302,6 +313,7 @@ func (s *Server) Shutdown() {
 	s.grMu.Unlock()
 	// Copy off the routes
 	for i, r := range s.routes {
+		r.setRouteNoReconnectOnClose()
 		conns[i] = r
 	}
 
@@ -327,6 +339,12 @@ func (s *Server) Shutdown() {
 		doneExpected++
 		s.http.Close()
 		s.http = nil
+	}
+
+	// Kick Profiling if its running
+	if s.profiler != nil {
+		doneExpected++
+		s.profiler.Close()
 	}
 
 	// Release the solicited routes connect go routines.
@@ -359,21 +377,25 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 		}
 	}()
 
-	hp := net.JoinHostPort(s.opts.Host, strconv.Itoa(s.opts.Port))
-	Noticef("Listening for client connections on %s", hp)
+	// Snapshot server options.
+	opts := s.getOpts()
+
+	hp := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
 	l, e := net.Listen("tcp", hp)
 	if e != nil {
-		Fatalf("Error listening on port: %s, %q", hp, e)
+		s.Fatalf("Error listening on port: %s, %q", hp, e)
 		return
 	}
+	s.Noticef("Listening for client connections on %s",
+		net.JoinHostPort(opts.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
 
 	// Alert of TLS enabled.
-	if s.opts.TLSConfig != nil {
-		Noticef("TLS required for client connections")
+	if opts.TLSConfig != nil {
+		s.Noticef("TLS required for client connections")
 	}
 
-	Debugf("Server id is %s", s.info.ID)
-	Noticef("Server is ready")
+	s.Debugf("Server id is %s", s.info.ID)
+	s.Noticef("Server is ready")
 
 	// Setup state that can enable shutdown
 	s.mu.Lock()
@@ -381,21 +403,21 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 
 	// If server was started with RANDOM_PORT (-1), opts.Port would be equal
 	// to 0 at the beginning this function. So we need to get the actual port
-	if s.opts.Port == 0 {
+	if opts.Port == 0 {
 		// Write resolved port back to options.
 		_, port, err := net.SplitHostPort(l.Addr().String())
 		if err != nil {
-			Fatalf("Error parsing server address (%s): %s", l.Addr().String(), e)
+			s.Fatalf("Error parsing server address (%s): %s", l.Addr().String(), e)
 			s.mu.Unlock()
 			return
 		}
 		portNum, err := strconv.Atoi(port)
 		if err != nil {
-			Fatalf("Error parsing server address (%s): %s", l.Addr().String(), e)
+			s.Fatalf("Error parsing server address (%s): %s", l.Addr().String(), e)
 			s.mu.Unlock()
 			return
 		}
-		s.opts.Port = portNum
+		opts.Port = portNum
 	}
 	s.mu.Unlock()
 
@@ -409,7 +431,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 		conn, err := l.Accept()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				Debugf("Temporary Client Accept Error(%v), sleeping %dms",
+				s.Errorf("Temporary Client Accept Error (%v), sleeping %dms",
 					ne, tmpDelay/time.Millisecond)
 				time.Sleep(tmpDelay)
 				tmpDelay *= 2
@@ -417,7 +439,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 					tmpDelay = ACCEPT_MAX_SLEEP
 				}
 			} else if s.isRunning() {
-				Noticef("Accept error: %v", err)
+				s.Errorf("Client Accept Error: %v", err)
 			}
 			continue
 		}
@@ -427,30 +449,84 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 			s.grWG.Done()
 		})
 	}
-	Noticef("Server Exiting..")
+	s.Noticef("Server Exiting..")
 	s.done <- true
 }
 
 // StartProfiler is called to enable dynamic profiling.
 func (s *Server) StartProfiler() {
-	Noticef("Starting profiling on http port %d", s.opts.ProfPort)
-	hp := net.JoinHostPort(s.opts.Host, strconv.Itoa(s.opts.ProfPort))
+	// Snapshot server options.
+	opts := s.getOpts()
+
+	port := opts.ProfPort
+
+	// Check for Random Port
+	if port == -1 {
+		port = 0
+	}
+
+	hp := net.JoinHostPort(opts.Host, strconv.Itoa(port))
+
+	l, err := net.Listen("tcp", hp)
+	s.Noticef("profiling port: %d", l.Addr().(*net.TCPAddr).Port)
+
+	if err != nil {
+		s.Fatalf("error starting profiler: %s", err)
+	}
+
+	srv := &http.Server{
+		Addr:           hp,
+		Handler:        http.DefaultServeMux,
+		ReadTimeout:    2 * time.Second,
+		WriteTimeout:   2 * time.Second,
+		MaxHeaderBytes: 1 << 20,
+	}
+
+	s.mu.Lock()
+	s.profiler = l
+	s.mu.Unlock()
+
 	go func() {
-		err := http.ListenAndServe(hp, nil)
+		// if this errors out, it's probably because the server is being shutdown
+		err := srv.Serve(l)
 		if err != nil {
-			Fatalf("error starting monitor server: %s", err)
+			s.Fatalf("error starting profiler: %s", err)
 		}
+		s.done <- true
 	}()
 }
 
 // StartHTTPMonitoring will enable the HTTP monitoring port.
+// DEPRECATED: Should use StartMonitoring.
 func (s *Server) StartHTTPMonitoring() {
 	s.startMonitoring(false)
 }
 
 // StartHTTPSMonitoring will enable the HTTPS monitoring port.
+// DEPRECATED: Should use StartMonitoring.
 func (s *Server) StartHTTPSMonitoring() {
 	s.startMonitoring(true)
+}
+
+// StartMonitoring starts the HTTP or HTTPs server if needed.
+func (s *Server) StartMonitoring() error {
+	// Snapshot server options.
+	opts := s.getOpts()
+
+	// Specifying both HTTP and HTTPS ports is a misconfiguration
+	if opts.HTTPPort != 0 && opts.HTTPSPort != 0 {
+		return fmt.Errorf("can't specify both HTTP (%v) and HTTPs (%v) ports", opts.HTTPPort, opts.HTTPSPort)
+	}
+	var err error
+	if opts.HTTPPort != 0 {
+		err = s.startMonitoring(false)
+	} else if opts.HTTPSPort != 0 {
+		if opts.TLSConfig == nil {
+			return fmt.Errorf("TLS cert and key required for HTTPS")
+		}
+		err = s.startMonitoring(true)
+	}
+	return err
 }
 
 // HTTP endpoints
@@ -464,7 +540,9 @@ const (
 )
 
 // Start the monitoring server
-func (s *Server) startMonitoring(secure bool) {
+func (s *Server) startMonitoring(secure bool) error {
+	// Snapshot server options.
+	opts := s.getOpts()
 
 	// Used to track HTTP requests
 	s.httpReqStats = map[string]uint64{
@@ -475,26 +553,41 @@ func (s *Server) startMonitoring(secure bool) {
 		SubszPath:  0,
 	}
 
-	var hp string
-	var err error
+	var (
+		hp           string
+		err          error
+		httpListener net.Listener
+		port         int
+	)
+
+	monitorProtocol := "http"
 
 	if secure {
-		hp = net.JoinHostPort(s.opts.HTTPHost, strconv.Itoa(s.opts.HTTPSPort))
-		Noticef("Starting https monitor on %s", hp)
-		config := util.CloneTLSConfig(s.opts.TLSConfig)
+		monitorProtocol += "s"
+		port = opts.HTTPSPort
+		if port == -1 {
+			port = 0
+		}
+		hp = net.JoinHostPort(opts.HTTPHost, strconv.Itoa(port))
+		config := util.CloneTLSConfig(opts.TLSConfig)
 		config.ClientAuth = tls.NoClientCert
-		s.http, err = tls.Listen("tcp", hp, config)
+		httpListener, err = tls.Listen("tcp", hp, config)
 
 	} else {
-		hp = net.JoinHostPort(s.opts.HTTPHost, strconv.Itoa(s.opts.HTTPPort))
-		Noticef("Starting http monitor on %s", hp)
-		s.http, err = net.Listen("tcp", hp)
+		port = opts.HTTPPort
+		if port == -1 {
+			port = 0
+		}
+		hp = net.JoinHostPort(opts.HTTPHost, strconv.Itoa(port))
+		httpListener, err = net.Listen("tcp", hp)
 	}
 
 	if err != nil {
-		Fatalf("Can't listen to the monitor port: %v", err)
-		return
+		return fmt.Errorf("can't listen to the monitor port: %v", err)
 	}
+
+	s.Noticef("Starting %s monitor on %s", monitorProtocol,
+		net.JoinHostPort(opts.HTTPHost, strconv.Itoa(httpListener.Addr().(*net.TCPAddr).Port)))
 
 	mux := http.NewServeMux()
 
@@ -520,16 +613,37 @@ func (s *Server) startMonitoring(secure bool) {
 		WriteTimeout:   2 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
+	s.mu.Lock()
+	s.http = httpListener
+	s.httpHandler = mux
+	s.mu.Unlock()
 
 	go func() {
-		srv.Serve(s.http)
+		srv.Serve(httpListener)
 		srv.Handler = nil
+		s.mu.Lock()
+		s.httpHandler = nil
+		s.mu.Unlock()
 		s.done <- true
 	}()
+
+	return nil
+}
+
+// HTTPHandler returns the http.Handler object used to handle monitoring
+// endpoints. It will return nil if the server is not configured for
+// monitoring, or if the server has not been started yet (Server.Start()).
+func (s *Server) HTTPHandler() http.Handler {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.httpHandler
 }
 
 func (s *Server) createClient(conn net.Conn) *client {
-	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: s.info.MaxPayload, start: time.Now()}
+	// Snapshot server options.
+	opts := s.getOpts()
+
+	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: int64(opts.MaxPayload), start: time.Now()}
 
 	// Grab JSON info string
 	s.mu.Lock()
@@ -547,11 +661,6 @@ func (s *Server) createClient(conn net.Conn) *client {
 
 	c.Debugf("Client connection created")
 
-	// Check for Auth
-	if authRequired {
-		c.setAuthTimer(secondsToDuration(s.opts.AuthTimeout))
-	}
-
 	// Send our information.
 	c.sendInfo(info)
 
@@ -568,9 +677,10 @@ func (s *Server) createClient(conn net.Conn) *client {
 		s.mu.Unlock()
 		return c
 	}
+
 	// If there is a max connections specified, check that adding
 	// this new client would not push us over the max
-	if s.opts.MaxConn > 0 && len(s.clients) >= s.opts.MaxConn {
+	if opts.MaxConn > 0 && len(s.clients) >= opts.MaxConn {
 		s.mu.Unlock()
 		c.maxConnExceeded()
 		return nil
@@ -584,11 +694,11 @@ func (s *Server) createClient(conn net.Conn) *client {
 	// Check for TLS
 	if tlsRequired {
 		c.Debugf("Starting TLS client connection handshake")
-		c.nc = tls.Server(c.nc, s.opts.TLSConfig)
+		c.nc = tls.Server(c.nc, opts.TLSConfig)
 		conn := c.nc.(*tls.Conn)
 
 		// Setup the timeout
-		ttl := secondsToDuration(s.opts.TLSTimeout)
+		ttl := secondsToDuration(opts.TLSTimeout)
 		time.AfterFunc(ttl, func() { tlsTimeout(c, conn) })
 		conn.SetReadDeadline(time.Now().Add(ttl))
 
@@ -611,6 +721,13 @@ func (s *Server) createClient(conn net.Conn) *client {
 	if c.nc == nil {
 		c.mu.Unlock()
 		return c
+	}
+
+	// Check for Auth. We schedule this timer after the TLS handshake to avoid
+	// the race where the timer fires during the handshake and causes the
+	// server to write bad data to the socket. See issue #432.
+	if authRequired {
+		c.setAuthTimer(secondsToDuration(opts.AuthTimeout))
 	}
 
 	if tlsRequired {
@@ -647,7 +764,7 @@ func (s *Server) updateServerINFO(urls []string) bool {
 	defer s.mu.Unlock()
 
 	// Feature disabled, do not update.
-	if s.opts.Cluster.NoAdvertise {
+	if s.getOpts().Cluster.NoAdvertise {
 		return false
 	}
 
@@ -699,65 +816,11 @@ func tlsVersion(ver uint16) string {
 
 // We use hex here so we don't need multiple versions
 func tlsCipher(cs uint16) string {
-	switch cs {
-	case 0x0005:
-		return "TLS_RSA_WITH_RC4_128_SHA"
-	case 0x000a:
-		return "TLS_RSA_WITH_3DES_EDE_CBC_SHA"
-	case 0x002f:
-		return "TLS_RSA_WITH_AES_128_CBC_SHA"
-	case 0x0035:
-		return "TLS_RSA_WITH_AES_256_CBC_SHA"
-	case 0xc007:
-		return "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA"
-	case 0xc009:
-		return "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"
-	case 0xc00a:
-		return "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA"
-	case 0xc011:
-		return "TLS_ECDHE_RSA_WITH_RC4_128_SHA"
-	case 0xc012:
-		return "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA"
-	case 0xc013:
-		return "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"
-	case 0xc014:
-		return "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA"
-	case 0xc02f:
-		return "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
-	case 0xc02b:
-		return "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
-	case 0xc030:
-		return "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
-	case 0xc02c:
-		return "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+	name, present := cipherMapByID[cs]
+	if present {
+		return name
 	}
 	return fmt.Sprintf("Unknown [%x]", cs)
-}
-
-func (s *Server) checkClientAuth(c *client) bool {
-	if s.cAuth == nil {
-		return true
-	}
-	return s.cAuth.Check(c)
-}
-
-func (s *Server) checkRouterAuth(c *client) bool {
-	if s.rAuth == nil {
-		return true
-	}
-	return s.rAuth.Check(c)
-}
-
-// Check auth and return boolean indicating if client is ok
-func (s *Server) checkAuth(c *client) bool {
-	switch c.typ {
-	case CLIENT:
-		return s.checkClientAuth(c)
-	case ROUTER:
-		return s.checkRouterAuth(c)
-	default:
-		return false
-	}
 }
 
 // Remove a client or route from our internal accounting.
@@ -829,6 +892,13 @@ func (s *Server) NumSubscriptions() uint32 {
 	return subs
 }
 
+// ConfigTime will report the last time the server configuration was loaded.
+func (s *Server) ConfigTime() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.configTime
+}
+
 // Addr will return the net.Addr object for the current listener.
 func (s *Server) Addr() net.Addr {
 	s.mu.Lock()
@@ -839,14 +909,37 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
+// MonitorAddr will return the net.Addr object for the monitoring listener.
+func (s *Server) MonitorAddr() *net.TCPAddr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.http == nil {
+		return nil
+	}
+	return s.http.Addr().(*net.TCPAddr)
+}
+
+// RouteAddr returns the net.Addr object for the route listener.
+func (s *Server) ClusterAddr() *net.TCPAddr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.routeListener == nil {
+		return nil
+	}
+	return s.routeListener.Addr().(*net.TCPAddr)
+}
+
 // ReadyForConnections returns `true` if the server is ready to accept client
 // and, if routing is enabled, route connections. If after the duration
 // `dur` the server is still not ready, returns `false`.
 func (s *Server) ReadyForConnections(dur time.Duration) bool {
+	// Snapshot server options.
+	opts := s.getOpts()
+
 	end := time.Now().Add(dur)
 	for time.Now().Before(end) {
 		s.mu.Lock()
-		ok := s.listener != nil && (s.opts.Cluster.Port == 0 || s.routeListener != nil)
+		ok := s.listener != nil && (opts.Cluster.Port == 0 || s.routeListener != nil)
 		s.mu.Unlock()
 		if ok {
 			return true
@@ -876,13 +969,16 @@ func (s *Server) startGoRoutine(f func()) {
 // port based on the server options' Host and Port. If the Host corresponds to
 // "any" interfaces, this call returns the list of resolved IP addresses.
 func (s *Server) getClientConnectURLs() []string {
+	// Snapshot server options.
+	opts := s.getOpts()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sPort := strconv.Itoa(s.opts.Port)
+	sPort := strconv.Itoa(opts.Port)
 	urls := make([]string, 0, 1)
 
-	ipAddr, err := net.ResolveIPAddr("ip", s.opts.Host)
+	ipAddr, err := net.ResolveIPAddr("ip", opts.Host)
 	// If the host is "any" (0.0.0.0 or ::), get specific IPs from available
 	// interfaces.
 	if err == nil && ipAddr.IP.IsUnspecified() {
@@ -913,10 +1009,10 @@ func (s *Server) getClientConnectURLs() []string {
 		// and not add any address in the array in the loop above, and we
 		// ended-up returning 0.0.0.0, which is problematic for Windows clients.
 		// Check for 0.0.0.0 or :: specifically, and ignore if that's the case.
-		if s.opts.Host == "0.0.0.0" || s.opts.Host == "::" {
-			Errorf("Address %q can not be resolved properly", s.opts.Host)
+		if opts.Host == "0.0.0.0" || opts.Host == "::" {
+			s.Errorf("Address %q can not be resolved properly", opts.Host)
 		} else {
-			urls = append(urls, net.JoinHostPort(s.opts.Host, sPort))
+			urls = append(urls, net.JoinHostPort(opts.Host, sPort))
 		}
 	}
 	return urls

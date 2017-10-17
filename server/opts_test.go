@@ -3,9 +3,14 @@
 package server
 
 import (
+	"bytes"
 	"crypto/tls"
+	"flag"
+	"io/ioutil"
 	"net/url"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,6 +56,7 @@ func TestOptions_RandomPort(t *testing.T) {
 
 func TestConfigFile(t *testing.T) {
 	golden := &Options{
+		ConfigFile:     "./configs/test.conf",
 		Host:           "localhost",
 		Port:           4242,
 		Username:       "derek",
@@ -60,7 +66,6 @@ func TestConfigFile(t *testing.T) {
 		Trace:          true,
 		Logtime:        false,
 		HTTPPort:       8222,
-		LogFile:        "/tmp/gnatsd.log",
 		PidFile:        "/tmp/gnatsd.pid",
 		ProfPort:       6543,
 		Syslog:         true,
@@ -86,10 +91,11 @@ func TestConfigFile(t *testing.T) {
 
 func TestTLSConfigFile(t *testing.T) {
 	golden := &Options{
+		ConfigFile:  "./configs/tls.conf",
 		Host:        "localhost",
 		Port:        4443,
 		Username:    "derek",
-		Password:    "buckley",
+		Password:    "foo",
 		AuthTimeout: 1.0,
 		TLSTimeout:  2.0,
 	}
@@ -205,6 +211,7 @@ func TestTLSConfigFile(t *testing.T) {
 
 func TestMergeOverrides(t *testing.T) {
 	golden := &Options{
+		ConfigFile:     "./configs/test.conf",
 		Host:           "localhost",
 		Port:           2222,
 		Username:       "derek",
@@ -214,7 +221,6 @@ func TestMergeOverrides(t *testing.T) {
 		Trace:          true,
 		Logtime:        false,
 		HTTPPort:       DEFAULT_HTTP_PORT,
-		LogFile:        "/tmp/gnatsd.log",
 		PidFile:        "/tmp/gnatsd.pid",
 		ProfPort:       6789,
 		Syslog:         true,
@@ -295,8 +301,9 @@ func TestRouteFlagOverride(t *testing.T) {
 	rurl, _ := url.Parse(routeFlag)
 
 	golden := &Options{
-		Host: "127.0.0.1",
-		Port: 7222,
+		ConfigFile: "./configs/srv_a.conf",
+		Host:       "127.0.0.1",
+		Port:       7222,
 		Cluster: ClusterOpts{
 			Host:        "127.0.0.1",
 			Port:        7244,
@@ -336,8 +343,9 @@ func TestClusterFlagsOverride(t *testing.T) {
 	// The server would then process the ClusterListenStr override and
 	// correctly override ClusterHost/ClustherPort/etc..
 	golden := &Options{
-		Host: "127.0.0.1",
-		Port: 7222,
+		ConfigFile: "./configs/srv_a.conf",
+		Host:       "127.0.0.1",
+		Port:       7222,
 		Cluster: ClusterOpts{
 			Host:        "127.0.0.1",
 			Port:        7244,
@@ -373,8 +381,9 @@ func TestRouteFlagOverrideWithMultiple(t *testing.T) {
 	rurls := RoutesFromStr(routeFlag)
 
 	golden := &Options{
-		Host: "127.0.0.1",
-		Port: 7222,
+		ConfigFile: "./configs/srv_a.conf",
+		Host:       "127.0.0.1",
+		Port:       7222,
 		Cluster: ClusterOpts{
 			Host:        "127.0.0.1",
 			Port:        7244,
@@ -603,5 +612,397 @@ func TestAuthorizationConfig(t *testing.T) {
 	subPerm = susan.Permissions.Subscribe[0]
 	if subPerm != "PUBLIC.>" {
 		t.Fatalf("Expected Susan's subscribe permissions to be 'PUBLIC.>', got %q\n", subPerm)
+	}
+}
+
+func TestTokenWithUserPass(t *testing.T) {
+	confFileName := "test.conf"
+	defer os.Remove(confFileName)
+	content := `
+	authorization={
+		user: user
+		pass: password
+		token: $2a$11$whatever
+	}`
+	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
+		t.Fatalf("Error writing config file: %v", err)
+	}
+	_, err := ProcessConfigFile(confFileName)
+	if err == nil {
+		t.Fatal("Expected error, got none")
+	}
+	if !strings.Contains(err.Error(), "token") {
+		t.Fatalf("Expected error related to token, got %v", err)
+	}
+}
+
+func TestTokenWithUsers(t *testing.T) {
+	confFileName := "test.conf"
+	defer os.Remove(confFileName)
+	content := `
+	authorization={
+		token: $2a$11$whatever
+		users: [
+			{user: test, password: test}
+		]
+	}`
+	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
+		t.Fatalf("Error writing config file: %v", err)
+	}
+	_, err := ProcessConfigFile(confFileName)
+	if err == nil {
+		t.Fatal("Expected error, got none")
+	}
+	if !strings.Contains(err.Error(), "token") {
+		t.Fatalf("Expected error related to token, got %v", err)
+	}
+}
+
+func TestParseWriteDeadline(t *testing.T) {
+	confFile := "test.conf"
+	defer os.Remove(confFile)
+	if err := ioutil.WriteFile(confFile, []byte("write_deadline: \"1x\"\n"), 0666); err != nil {
+		t.Fatalf("Error writing config file: %v", err)
+	}
+	_, err := ProcessConfigFile(confFile)
+	if err == nil {
+		t.Fatal("Expected error, got none")
+	}
+	if !strings.Contains(err.Error(), "parsing") {
+		t.Fatalf("Expected error related to parsing, got %v", err)
+	}
+	os.Remove(confFile)
+	if err := ioutil.WriteFile(confFile, []byte("write_deadline: \"1s\"\n"), 0666); err != nil {
+		t.Fatalf("Error writing config file: %v", err)
+	}
+	opts, err := ProcessConfigFile(confFile)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if opts.WriteDeadline != time.Second {
+		t.Fatalf("Expected write_deadline to be 1s, got %v", opts.WriteDeadline)
+	}
+	os.Remove(confFile)
+	oldStdout := os.Stdout
+	_, w, _ := os.Pipe()
+	defer func() {
+		w.Close()
+		os.Stdout = oldStdout
+	}()
+	os.Stdout = w
+	if err := ioutil.WriteFile(confFile, []byte("write_deadline: 2\n"), 0666); err != nil {
+		t.Fatalf("Error writing config file: %v", err)
+	}
+	opts, err = ProcessConfigFile(confFile)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if opts.WriteDeadline != 2*time.Second {
+		t.Fatalf("Expected write_deadline to be 2s, got %v", opts.WriteDeadline)
+	}
+}
+
+func TestOptionsClone(t *testing.T) {
+	opts := &Options{
+		ConfigFile:     "./configs/test.conf",
+		Host:           "localhost",
+		Port:           2222,
+		Username:       "derek",
+		Password:       "spooky",
+		AuthTimeout:    1.0,
+		Debug:          true,
+		Trace:          true,
+		Logtime:        false,
+		HTTPPort:       DEFAULT_HTTP_PORT,
+		PidFile:        "/tmp/gnatsd.pid",
+		ProfPort:       6789,
+		Syslog:         true,
+		RemoteSyslog:   "udp://foo.com:33",
+		MaxControlLine: 2048,
+		MaxPayload:     65536,
+		MaxConn:        100,
+		PingInterval:   60 * time.Second,
+		MaxPingsOut:    3,
+		Cluster: ClusterOpts{
+			NoAdvertise:    true,
+			ConnectRetries: 2,
+		},
+		WriteDeadline: 3 * time.Second,
+		Routes:        []*url.URL{&url.URL{}},
+		Users:         []*User{&User{Username: "foo", Password: "bar"}},
+	}
+
+	clone := opts.Clone()
+
+	if !reflect.DeepEqual(opts, clone) {
+		t.Fatalf("Cloned Options are incorrect.\nexpected: %+v\ngot: %+v",
+			clone, opts)
+	}
+
+	clone.Users[0].Password = "baz"
+	if reflect.DeepEqual(opts, clone) {
+		t.Fatal("Expected Options to be different")
+	}
+}
+
+func TestOptionsCloneNilLists(t *testing.T) {
+	opts := &Options{}
+
+	clone := opts.Clone()
+
+	if clone.Routes != nil {
+		t.Fatalf("Expected Routes to be nil, got: %v", clone.Routes)
+	}
+	if clone.Users != nil {
+		t.Fatalf("Expected Users to be nil, got: %v", clone.Users)
+	}
+}
+
+func TestOptionsCloneNil(t *testing.T) {
+	opts := (*Options)(nil)
+	clone := opts.Clone()
+	if clone != nil {
+		t.Fatalf("Expected nil, got: %+v", clone)
+	}
+}
+
+func TestEmptyConfig(t *testing.T) {
+	opts, err := ProcessConfigFile("")
+
+	if err != nil {
+		t.Fatalf("Expected no error from empty config, got: %+v", err)
+	}
+
+	if opts.ConfigFile != "" {
+		t.Fatalf("Expected empty config, got: %+v", opts)
+	}
+}
+
+func TestMalformedListenAddress(t *testing.T) {
+	opts, err := ProcessConfigFile("./configs/malformed_listen_address.conf")
+	if err == nil {
+		t.Fatalf("Expected an error reading config file: got %+v\n", opts)
+	}
+}
+
+func TestMalformedClusterAddress(t *testing.T) {
+	opts, err := ProcessConfigFile("./configs/malformed_cluster_address.conf")
+	if err == nil {
+		t.Fatalf("Expected an error reading config file: got %+v\n", opts)
+	}
+}
+
+func TestOptionsProcessConfigFile(t *testing.T) {
+	// Create options with default values of Debug and Trace
+	// that are the opposite of what is in the config file.
+	// Set another option that is not present in the config file.
+	logFileName := "test.log"
+	opts := &Options{
+		Debug:   true,
+		Trace:   false,
+		LogFile: logFileName,
+	}
+	configFileName := "./configs/test.conf"
+	if err := opts.ProcessConfigFile(configFileName); err != nil {
+		t.Fatalf("Error processing config file: %v", err)
+	}
+	// Verify that values are as expected
+	if opts.ConfigFile != configFileName {
+		t.Fatalf("Expected ConfigFile to be set to %q, got %v", configFileName, opts.ConfigFile)
+	}
+	if opts.Debug {
+		t.Fatal("Debug option should have been set to false from config file")
+	}
+	if !opts.Trace {
+		t.Fatal("Trace option should have been set to true from config file")
+	}
+	if opts.LogFile != logFileName {
+		t.Fatalf("Expected LogFile to be %q, got %q", logFileName, opts.LogFile)
+	}
+}
+
+func TestConfigureOptions(t *testing.T) {
+	// Options.Configure() will snapshot the flags. This is used by the reload code.
+	// We need to set it back to nil otherwise it will impact reload tests.
+	defer func() { FlagSnapshot = nil }()
+
+	ch := make(chan bool, 1)
+	checkPrintInvoked := func() {
+		ch <- true
+	}
+	usage := func() { panic("should not get there") }
+	var fs *flag.FlagSet
+	type testPrint struct {
+		args                   []string
+		version, help, tlsHelp func()
+	}
+	testFuncs := []testPrint{
+		testPrint{[]string{"-v"}, checkPrintInvoked, usage, PrintTLSHelpAndDie},
+		testPrint{[]string{"version"}, checkPrintInvoked, usage, PrintTLSHelpAndDie},
+		testPrint{[]string{"-h"}, PrintServerAndExit, checkPrintInvoked, PrintTLSHelpAndDie},
+		testPrint{[]string{"help"}, PrintServerAndExit, checkPrintInvoked, PrintTLSHelpAndDie},
+		testPrint{[]string{"-help_tls"}, PrintServerAndExit, usage, checkPrintInvoked},
+	}
+	for _, tf := range testFuncs {
+		fs = flag.NewFlagSet("test", flag.ContinueOnError)
+		opts, err := ConfigureOptions(fs, tf.args, tf.version, tf.help, tf.tlsHelp)
+		if err != nil {
+			t.Fatalf("Error on configure: %v", err)
+		}
+		if opts != nil {
+			t.Fatalf("Expected options to be nil, got %v", opts)
+		}
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("Should have invoked print function for args=%v", tf.args)
+		}
+	}
+
+	// Helper function that expect parsing with given args to not produce an error.
+	mustNotFail := func(args []string) *Options {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		opts, err := ConfigureOptions(fs, args, PrintServerAndExit, fs.Usage, PrintTLSHelpAndDie)
+		if err != nil {
+			stackFatalf(t, "Error on configure: %v", err)
+		}
+		return opts
+	}
+
+	// Helper function that expect configuration to fail.
+	expectToFail := func(args []string, errContent ...string) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		// Silence the flagSet so that on failure nothing is printed.
+		// (flagSet would print error message about unknown flags, etc..)
+		silenceOuput := &bytes.Buffer{}
+		fs.SetOutput(silenceOuput)
+		opts, err := ConfigureOptions(fs, args, PrintServerAndExit, fs.Usage, PrintTLSHelpAndDie)
+		if opts != nil || err == nil {
+			stackFatalf(t, "Expected no option and an error, got opts=%v and err=%v", opts, err)
+		}
+		for _, testErr := range errContent {
+			if strings.Contains(err.Error(), testErr) {
+				// We got the error we wanted.
+				return
+			}
+		}
+		stackFatalf(t, "Expected errors containing any of those %v, got %v", errContent, err)
+	}
+
+	// Basic test with port number
+	opts := mustNotFail([]string{"-p", "1234"})
+	if opts.Port != 1234 {
+		t.Fatalf("Expected port to be 1234, got %v", opts.Port)
+	}
+
+	// Should fail because of unknown parameter
+	expectToFail([]string{"foo"}, "command")
+
+	// Should fail because unknown flag
+	expectToFail([]string{"-xxx", "foo"}, "flag")
+
+	// Should fail because of config file missing
+	expectToFail([]string{"-c", "xxx.cfg"}, "file")
+
+	// Should fail because of too many args for signal command
+	expectToFail([]string{"-sl", "quit=pid=foo"}, "signal")
+
+	// Should fail because of invalid pid
+	// On windows, if not running with admin privileges, you would get access denied.
+	expectToFail([]string{"-sl", "quit=pid"}, "pid", "denied")
+
+	// The config file set Trace to true.
+	opts = mustNotFail([]string{"-c", "./configs/test.conf"})
+	if !opts.Trace {
+		t.Fatal("Trace should have been set to true")
+	}
+
+	// The config file set Trace to true, but was overridden by param -V=false
+	opts = mustNotFail([]string{"-c", "./configs/test.conf", "-V=false"})
+	if opts.Trace {
+		t.Fatal("Trace should have been set to false")
+	}
+
+	// The config file set Trace to true, but was overridden by param -DV=false
+	opts = mustNotFail([]string{"-c", "./configs/test.conf", "-DV=false"})
+	if opts.Debug || opts.Trace {
+		t.Fatal("Debug and Trace should have been set to false")
+	}
+
+	// The config file set Trace to true, but was overridden by param -DV
+	opts = mustNotFail([]string{"-c", "./configs/test.conf", "-DV"})
+	if !opts.Debug || !opts.Trace {
+		t.Fatal("Debug and Trace should have been set to true")
+	}
+
+	// This should fail since -cluster is missing
+	expectedURL, _ := url.Parse("nats://localhost:6223")
+	expectToFail([]string{"-routes", expectedURL.String()}, "solicited routes")
+
+	// Ensure that we can set cluster and routes from command line
+	opts = mustNotFail([]string{"-cluster", "nats://localhost:6222", "-routes", expectedURL.String()})
+	if opts.Cluster.ListenStr != "nats://localhost:6222" {
+		t.Fatalf("Unexpected Cluster.ListenStr=%q", opts.Cluster.ListenStr)
+	}
+	if opts.RoutesStr != "nats://localhost:6223" || len(opts.Routes) != 1 || opts.Routes[0].String() != expectedURL.String() {
+		t.Fatalf("Unexpected RoutesStr: %q and Routes: %v", opts.RoutesStr, opts.Routes)
+	}
+
+	// Use a config with cluster configuration and explicit route defined.
+	// Override with empty routes string.
+	opts = mustNotFail([]string{"-c", "./configs/srv_a.conf", "-routes", ""})
+	if opts.RoutesStr != "" || len(opts.Routes) != 0 {
+		t.Fatalf("Unexpected RoutesStr: %q and Routes: %v", opts.RoutesStr, opts.Routes)
+	}
+
+	// Use a config with cluster configuration and override cluster listen string
+	expectedURL, _ = url.Parse("nats-route://ruser:top_secret@127.0.0.1:7246")
+	opts = mustNotFail([]string{"-c", "./configs/srv_a.conf", "-cluster", "nats://ivan:pwd@localhost:6222"})
+	if opts.Cluster.Username != "ivan" || opts.Cluster.Password != "pwd" || opts.Cluster.Port != 6222 ||
+		len(opts.Routes) != 1 || opts.Routes[0].String() != expectedURL.String() {
+		t.Fatalf("Unexpected Cluster and/or Routes: %#v - %v", opts.Cluster, opts.Routes)
+	}
+
+	// Disable clustering from command line
+	opts = mustNotFail([]string{"-c", "./configs/srv_a.conf", "-cluster", ""})
+	if opts.Cluster.Port != 0 {
+		t.Fatalf("Unexpected Cluster: %v", opts.Cluster)
+	}
+
+	// Various erros due to malformed cluster listen string.
+	// (adding -routes to have more than 1 set flag to check
+	// that Visit() stops when an error is found).
+	expectToFail([]string{"-cluster", ":", "-routes", ""}, "protocol")
+	expectToFail([]string{"-cluster", "nats://localhost", "-routes", ""}, "port")
+	expectToFail([]string{"-cluster", "nats://localhost:xxx", "-routes", ""}, "integer")
+	expectToFail([]string{"-cluster", "nats://ivan:localhost:6222", "-routes", ""}, "colons")
+	expectToFail([]string{"-cluster", "nats://ivan@localhost:6222", "-routes", ""}, "password")
+
+	// Override config file's TLS configuration from command line, and completely disable TLS
+	opts = mustNotFail([]string{"-c", "./configs/tls.conf", "-tls=false"})
+	if opts.TLSConfig != nil || opts.TLS {
+		t.Fatal("Expected TLS to be disabled")
+	}
+	// Override config file's TLS configuration from command line, and force TLS verification.
+	// However, since TLS config has to be regenerated, user need to provide -tlscert and -tlskey too.
+	// So this should fail.
+	expectToFail([]string{"-c", "./configs/tls.conf", "-tlsverify"}, "valid")
+
+	// Now same than above, but with all valid params.
+	opts = mustNotFail([]string{"-c", "./configs/tls.conf", "-tlsverify", "-tlscert", "./configs/certs/server.pem", "-tlskey", "./configs/certs/key.pem"})
+	if opts.TLSConfig == nil || !opts.TLSVerify {
+		t.Fatal("Expected TLS to be configured and force verification")
+	}
+
+	// Configure TLS, but some TLS params missing
+	expectToFail([]string{"-tls"}, "valid")
+	expectToFail([]string{"-tls", "-tlscert", "./configs/certs/server.pem"}, "valid")
+	// One of the file does not exist
+	expectToFail([]string{"-tls", "-tlscert", "./configs/certs/server.pem", "-tlskey", "./configs/certs/notfound.pem"}, "file")
+
+	// Configure TLS and check that this results in a TLSConfig option.
+	opts = mustNotFail([]string{"-tls", "-tlscert", "./configs/certs/server.pem", "-tlskey", "./configs/certs/key.pem"})
+	if opts.TLSConfig == nil || !opts.TLS {
+		t.Fatal("Expected TLSConfig to be set")
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2013-2015 Apcera Inc. All rights reserved.
+// Copyright 2013-2017 Apcera Inc. All rights reserved.
 
 package server
 
@@ -82,9 +82,11 @@ func (s *Server) HandleConnz(w http.ResponseWriter, r *http.Request) {
 	auth, _ := strconv.Atoi(r.URL.Query().Get("auth"))
 	subs, _ := strconv.Atoi(r.URL.Query().Get("subs"))
 	c.Offset, _ = strconv.Atoi(r.URL.Query().Get("offset"))
+	if c.Offset < 0 {
+		c.Offset = 0
+	}
 	c.Limit, _ = strconv.Atoi(r.URL.Query().Get("limit"))
-
-	if c.Limit == 0 {
+	if c.Limit <= 0 {
 		c.Limit = DefaultConnListSize
 	}
 
@@ -240,7 +242,7 @@ func (s *Server) HandleConnz(w http.ResponseWriter, r *http.Request) {
 
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
-		Errorf("Error marshalling response to /connz request: %v", err)
+		s.Errorf("Error marshaling response to /connz request: %v", err)
 	}
 
 	// Handle response
@@ -318,20 +320,20 @@ func (s *Server) HandleRoutez(w http.ResponseWriter, r *http.Request) {
 			}
 			ri.Subs = castToSliceString(sublist)
 		}
-		r.mu.Unlock()
-
-		if ip, ok := r.nc.(*net.TCPConn); ok {
-			addr := ip.RemoteAddr().(*net.TCPAddr)
+		switch conn := r.nc.(type) {
+		case *net.TCPConn, *tls.Conn:
+			addr := conn.RemoteAddr().(*net.TCPAddr)
 			ri.Port = addr.Port
 			ri.IP = addr.IP.String()
 		}
+		r.mu.Unlock()
 		rs.Routes = append(rs.Routes, ri)
 	}
 	s.mu.Unlock()
 
 	b, err := json.MarshalIndent(rs, "", "  ")
 	if err != nil {
-		Errorf("Error marshalling response to /routez request: %v", err)
+		s.Errorf("Error marshaling response to /routez request: %v", err)
 	}
 
 	// Handle response
@@ -347,7 +349,7 @@ func (s *Server) HandleSubsz(w http.ResponseWriter, r *http.Request) {
 	st := &Subsz{s.sl.Stats()}
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
-		Errorf("Error marshalling response to /subscriptionsz request: %v", err)
+		s.Errorf("Error marshaling response to /subscriptionsz request: %v", err)
 	}
 
 	// Handle response
@@ -397,12 +399,7 @@ type Varz struct {
 	SlowConsumers    int64             `json:"slow_consumers"`
 	Subscriptions    uint32            `json:"subscriptions"`
 	HTTPReqStats     map[string]uint64 `json:"http_req_stats"`
-}
-
-type usage struct {
-	CPU   float32
-	Cores int
-	Mem   int64
+	ConfigLoadTime   time.Time         `json:"config_load_time"`
 }
 
 func myUptime(d time.Duration) string {
@@ -461,7 +458,10 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 
 // HandleVarz will process HTTP requests for server information.
 func (s *Server) HandleVarz(w http.ResponseWriter, r *http.Request) {
-	v := &Varz{Info: &s.info, Options: s.opts, MaxPayload: s.opts.MaxPayload, Start: s.start}
+	// Snapshot server options.
+	opts := s.getOpts()
+
+	v := &Varz{Info: &s.info, Options: opts, MaxPayload: opts.MaxPayload, Start: s.start}
 	v.Now = time.Now()
 	v.Uptime = myUptime(time.Since(s.start))
 	v.Port = v.Info.Port
@@ -473,12 +473,13 @@ func (s *Server) HandleVarz(w http.ResponseWriter, r *http.Request) {
 	v.TotalConnections = s.totalClients
 	v.Routes = len(s.routes)
 	v.Remotes = len(s.remotes)
-	v.InMsgs = s.inMsgs
-	v.InBytes = s.inBytes
-	v.OutMsgs = s.outMsgs
-	v.OutBytes = s.outBytes
-	v.SlowConsumers = s.slowConsumers
+	v.InMsgs = atomic.LoadInt64(&s.inMsgs)
+	v.InBytes = atomic.LoadInt64(&s.inBytes)
+	v.OutMsgs = atomic.LoadInt64(&s.outMsgs)
+	v.OutBytes = atomic.LoadInt64(&s.outBytes)
+	v.SlowConsumers = atomic.LoadInt64(&s.slowConsumers)
 	v.Subscriptions = s.sl.Count()
+	v.ConfigLoadTime = s.configTime
 	s.httpReqStats[VarzPath]++
 	// Need a copy here since s.httpReqStas can change while doing
 	// the marshaling down below.
@@ -490,7 +491,7 @@ func (s *Server) HandleVarz(w http.ResponseWriter, r *http.Request) {
 
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		Errorf("Error marshalling response to /varz request: %v", err)
+		s.Errorf("Error marshaling response to /varz request: %v", err)
 	}
 
 	// Handle response
